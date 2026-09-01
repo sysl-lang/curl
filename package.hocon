@@ -1,0 +1,35 @@
+// libcurl -- the transfer library -- bound for sysl.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       curl { git = "github.com/sysl-lang/curl", version = "0.1.0" }
+//     }
+//
+// **libcurl is not vendored and could not usefully be.** It is a large library with a platform
+// build, a TLS backend chosen at compile time and a CA store story that is the platform's; every
+// machine that would run this already has it. `pkg_config` is what asks where.
+
+package {
+  name    = "curl"
+  version = "0.1.0"
+
+  // The compiler this was written against. What it certainly needs is a variadic `extern` called
+  // with the argument typed at the call site, which is how every `curl_easy_setopt` here is made.
+  sysl = "0.0.98"
+}
+
+// **`heap`, because a handle is a `&Client`.** libcurl hands a callback the pointer it was given in
+// `CURLOPT_WRITEDATA` and nothing else, so the sysl value that pointer names has to stay where it
+// was put -- and a `&T` box is what does not move.
+//
+// **`posix`, because this is a network library.** It resolves names, opens sockets and reads a
+// clock; there is no configuration of it that does not.
+requires {
+  heap  = true
+  posix = true
+
+  pkg_config {
+    libcurl = "libcurl — the system copy on macOS, Debian's libcurl4-openssl-dev, Arch's curl"
+  }
+}

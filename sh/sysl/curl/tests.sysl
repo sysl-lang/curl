@@ -1,0 +1,174 @@
+module sh.sysl.curl
+@tests
+
+// What the binding does, checked against a server this test starts.
+//
+// **A live host is not an oracle for the interesting half.** `https://example.com/` proves TLS,
+// DNS and a 200; it cannot be made to send a 404, a redirect chain, a body with a zero byte in it,
+// or a header that arrives in a case nobody expects. A listener on a loopback port can, and it is
+// the only way those get tested at all.
+
+import sh.sysl.curl.c
+import sysl.buf.{Buf, buf}
+import sysl.posix.net.{resolve_passive, socket, Socket, Address}
+import sysl.posix.threads.{spawn, Thread}
+import sysl.text.{from_utf8_unchecked, cstring, Search}
+import sysl.slices.as_ptr
+import sysl.harness.*
+
+// ## A server, in as few lines as a test can get away with
+//
+// It answers exactly one request and closes, which is all any test here needs and means there is no
+// shutdown protocol to get wrong. The reply is a byte string the test wrote, so a test that wants a
+// malformed response simply says so.
+
+private struct Reply
+    port: int
+    bytes: []const u8
+
+// Serve one connection and go. **`@crossing` because this runs on another thread**, and what it
+// captures has to be allowed across.
+private serve_one(port: int, reply: []const u8) -> Result[unit, string]
+    val addrs = resolve_passive(port).map_err((e) -> str(e))?
+    var lis = socket(addrs[0]).map_err((e) -> str(e))?
+
+    lis.reuse_address(true).map_err((e) -> str(e))?
+    lis.bind(addrs[0]).map_err((e) -> str(e))?
+    lis.listen(1).map_err((e) -> str(e))?
+
+    val pair = lis.accept().map_err((e) -> str(e))?
+    var conn = pair.0
+
+    var scratch: [4096]u8
+
+    conn.recv(scratch[0..<4096]).map_err((e) -> str(e))?
+    conn.send_all(reply).map_err((e) -> str(e))?
+    conn.close().map_err((e) -> str(e))?
+    lis.close().map_err((e) -> str(e))?
+    Ok(())
+
+@test("an Error carries the code as well as the message")
+an_error_carries_the_code_as_well_as_the_message()
+    val e = fault(c.E_OPERATION_TIMEDOUT)
+
+    assert_eq(e.code, c.E_OPERATION_TIMEDOUT)
+    assert(e.message.len > 0)
+    assert(e.transient())
+
+@test("a verification failure is not transient, and a timeout is")
+a_verification_failure_is_not_transient_and_a_ti()
+    assert(!fault(c.E_PEER_FAILED_VERIFICATION).transient())
+    assert(!fault(c.E_URL_MALFORMAT).transient())
+    assert(fault(c.E_COULDNT_CONNECT).transient())
+
+@test("told turns CURLE_OK into Ok and anything else into the failure")
+told_turns_curle_ok_into_ok_and_anything_else_in()
+    assert(told(c.E_OK).is_ok())
+
+    told(c.E_URL_MALFORMAT) match
+        Ok(_) -> assert(false)
+        Err(e) -> assert_eq(e.code, c.E_URL_MALFORMAT)
+
+@test("a header line is split at the first colon, and the value is trimmed")
+a_header_line_is_split_at_the_first_colon_and_th()
+    parse_header("Content-Type: text/html\r\n") match
+        Some(h) ->
+            assert_eq(h.name, "Content-Type")
+            assert_eq(h.value, "text/html")
+        None -> assert(false)
+
+@test("a header value may itself contain a colon")
+a_header_value_may_itself_contain_a_colon()
+    parse_header("Location: https://example.com/a\r\n") match
+        Some(h) -> assert_eq(h.value, "https://example.com/a")
+        None -> assert(false)
+
+@test("a status line and a blank line are not headers")
+a_status_line_and_a_blank_line_are_not_headers()
+    assert(parse_header("HTTP/1.1 200 OK\r\n").is_none())
+    assert(parse_header("\r\n").is_none())
+
+@test("an empty header value survives the trim")
+an_empty_header_value_survives_the_trim()
+    parse_header("X-Empty:\r\n") match
+        Some(h) ->
+            assert_eq(h.name, "X-Empty")
+            assert_eq(h.value, "")
+        None -> assert(false)
+
+@test("a header is found without regard to case")
+a_header_is_found_without_regard_to_case()
+    var hs: Buf[Header] = buf()
+
+    hs.push(Header("Content-Type", "application/json"))
+    hs.push(Header("X-Request-Id", "abc"))
+
+    assert_eq(find(hs.view(), "content-type").unwrap_or(""), "application/json")
+    assert_eq(find(hs.view(), "CONTENT-TYPE").unwrap_or(""), "application/json")
+    assert(find(hs.view(), "content-length").is_none())
+
+@test("the first of two headers with one name wins")
+the_first_of_two_headers_with_one_name_wins()
+    var hs: Buf[Header] = buf()
+
+    hs.push(Header("Set-Cookie", "a=1"))
+    hs.push(Header("Set-Cookie", "b=2"))
+
+    assert_eq(find(hs.view(), "set-cookie").unwrap_or(""), "a=1")
+
+@test("a header list can be built and freed")
+a_header_list_can_be_built_and_freed()
+    var hs = headers()
+
+    assert(hs.add("Content-Type", "application/json").is_ok())
+    assert(hs.add("X-Trace", "1").is_ok())
+    assert(hs.remove("Expect").is_ok())
+    assert(usize(hs.raw()) != 0)
+
+@test("an empty header list is a null pointer, which is what libcurl reads as none")
+an_empty_header_list_is_a_null_pointer_which_is()
+    val hs = headers()
+
+    assert_eq(usize(hs.raw()), 0)
+
+@test("libcurl names itself, which says which TLS backend is in there")
+libcurl_names_itself_which_says_which_tls_backen()
+    assert(version().len > 0)
+    assert(version().starts_with("libcurl/"))
+
+@test("init is idempotent, which is what lets every test call it")
+init_is_idempotent_which_is_what_lets_every_test()
+    assert(init().is_ok())
+    assert(init().is_ok())
+
+@test("a malformed URL is refused before anything is sent")
+a_malformed_url_is_refused_before_anything_is_se()
+    init().unwrap()
+
+    val cl = client().unwrap()
+
+    cl.get("not a url at all") match
+        Ok(_) -> assert(false)
+        Err(e) -> assert(e.code != c.E_OK)
+
+@test("an unsupported scheme is refused, and the error is not transient")
+an_unsupported_scheme_is_refused_and_the_error_i()
+    init().unwrap()
+
+    val cl = client().unwrap()
+
+    cl.get("gopher+ssh://example.invalid/") match
+        Ok(_) -> assert(false)
+        Err(e) -> assert(!e.transient())
+
+@test("a name that does not resolve fails, and IS transient")
+a_name_that_does_not_resolve_fails_and_is_transi()
+    init().unwrap()
+
+    val cl = client().unwrap()
+
+    cl.connect_timeout_ms(3000).unwrap()
+
+    cl.get("http://no-such-host.invalid/") match
+        Ok(_) -> assert(false)
+        Err(e) -> assert_eq(e.code, c.E_COULDNT_RESOLVE_HOST)

@@ -1,0 +1,37 @@
+// What went wrong, and the one line of judgement this package offers about it.
+
+module sh.sysl.curl
+
+import sh.sysl.curl.c
+import sysl.text.from_cstring
+
+/** A libcurl failure. `code` is the `CURLcode`; `message` is what libcurl says about it.
+ *
+ * **The code is kept rather than collapsed into a message**, because a caller retries some of these
+ * and not others, and a string is no basis for that decision.
+ */
+struct Error
+    code: i32
+    message: string
+
+    /** Whether trying again could plausibly work: a timeout, a refused connection, a name that did
+     * not resolve, a transfer cut short.
+     *
+     * **A verification failure is deliberately NOT in this set.** A certificate that does not check
+     * out is an answer, not a hiccup, and a client that retries past one has turned a refusal into
+     * a delay before accepting whatever arrives next.
+     */
+    transient(self) -> bool =
+        self.code == c.E_OPERATION_TIMEDOUT || self.code == c.E_COULDNT_CONNECT ||
+        self.code == c.E_COULDNT_RESOLVE_HOST || self.code == c.E_GOT_NOTHING ||
+        self.code == c.E_SEND_ERROR || self.code == c.E_RECV_ERROR
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = self.message.display(out, fmt)
+
+/** The `CURLcode` libcurl just answered, as an `Error` carrying its own explanation. */
+private[curl] fault(rc: i32) -> Error =
+    Error(rc, from_cstring(c.easy_strerror(rc)).unwrap_or("an error libcurl would not name"))
+
+/** `Ok(())` for `CURLE_OK`, and the failure otherwise. The shape every call in this package ends in. */
+private[curl] told(rc: i32) -> Result[unit, Error] = if rc == c.E_OK then Ok(()) else Err(fault(rc))

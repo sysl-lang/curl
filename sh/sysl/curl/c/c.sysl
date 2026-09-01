@@ -1,0 +1,184 @@
+// libcurl, declared verbatim.
+//
+// **Nothing here is meant to be called by a program.** Every name and every convention is C's: a
+// handle is a pointer libcurl allocated, a failure is a `CURLcode` whose meaning has to be asked
+// for separately, and a string is a `*u8` somebody else owns. `easy.sysl` and `request.sysl` turn
+// those into sysl and are what an application imports.
+//
+// **Each declaration was read out of the header rather than remembered**, because a signature that
+// disagrees with libcurl's links perfectly and corrupts the call at run time, and nothing in this
+// arrangement checks one against the other.
+//
+// **THIS IS A PARTIAL BINDING AND SAYS SO.** libcurl's surface is several hundred functions and 291
+// options; what is here is the easy interface for HTTP, which is the reason the package exists.
+// Adding to it is ordinary -- the rule is only that what is here is faithful, not that it is
+// complete.
+//
+// ## `curl_easy_setopt` is variadic, and the declaration has to say so
+//
+// **It is declared with the two fixed parameters C gives it and no more.** On Apple arm64 a
+// variadic argument goes on the stack where a fixed one goes in a register, so a declaration
+// carrying the value as a third *fixed* parameter compiles, links, and hands libcurl whatever
+// happened to be on the stack -- `curl_easy_setopt` then answers `CURLE_OK` having stored nothing,
+// and the failure surfaces much later as a fault inside `curl_easy_perform`. Checked both ways with
+// `CURLOPT_PRIVATE`/`CURLINFO_PRIVATE`, whose round trip is exactly this question and needs no
+// network.
+//
+// **One declaration serves every option class**, because sysl types the variadic extra at the call
+// site. The typed wrappers in `easy.sysl` are what make a caller unable to pass an `int` where
+// libcurl reads a `long`.
+
+module sh.sysl.curl.c
+@link("curl")
+
+@include("curl/curl.h")
+@include("curl/easy.h")
+
+// ## The handles
+//
+// Both are structs libcurl allocates and hands back a pointer to. `opaque struct` is that claim,
+// and it is what stops a `Slist` being passed where an `Easy` is wanted.
+
+opaque struct Easy
+opaque struct Slist
+
+// ## The library
+
+@needs(os)
+extern "curl_global_init" global_init(flags: long) -> i32
+
+extern "curl_global_cleanup" global_cleanup()
+extern "curl_version" version() -> *u8
+
+// ## One transfer
+
+@needs(os)
+extern "curl_easy_init" easy_init() -> *Easy
+
+extern "curl_easy_cleanup" easy_cleanup(h: *Easy)
+
+@needs(os)
+extern "curl_easy_perform" easy_perform(h: *Easy) -> i32
+
+extern "curl_easy_reset" easy_reset(h: *Easy)
+extern "curl_easy_strerror" easy_strerror(rc: i32) -> *u8
+
+// **Variadic, with the two fixed parameters C declares and no more.** See the note at the top of
+// this file -- this is the one declaration in the package where getting the shape wrong produces a
+// working build and a corrupted call.
+extern "curl_easy_setopt" setopt(h: *Easy, opt: i32, ...) -> i32
+extern "curl_easy_getinfo" getinfo(h: *Easy, info: i32, ...) -> i32
+
+// ## A list of strings, which is how libcurl takes request headers
+//
+// `slist_append` takes ownership of nothing and copies the string; it answers a new head, or null
+// if it could not allocate -- **and on null the list it was given is leaked**, since there is no
+// longer a pointer to it. `Headers` in `easy.sysl` is what keeps the head so that cannot happen.
+
+@needs(os)
+extern "curl_slist_append" slist_append(l: *Slist, s: *u8) -> *Slist
+
+extern "curl_slist_free_all" slist_free_all(l: *Slist)
+
+// ## Percent-encoding
+//
+// Both answer storage libcurl allocated, which the caller gives back with `curl_free` -- not the
+// platform's `free`, because libcurl may have been built against a different allocator.
+
+@needs(os)
+extern "curl_easy_escape" easy_escape(h: *Easy, s: *u8, len: i32) -> *u8
+
+@needs(os)
+extern "curl_easy_unescape" easy_unescape(h: *Easy, s: *u8, len: i32, out: *i32) -> *u8
+
+extern "curl_free" free(p: *u8)
+
+// ## The constants
+//
+// Read from the machine's own headers rather than written down, so a libcurl that renumbers an
+// option follows rather than breaking. **`CURLOPT_*` and `CURLINFO_*` are enum constants, not
+// macros**, and a `c const` block reads either.
+
+c const
+    GLOBAL_DEFAULT: long = "CURL_GLOBAL_DEFAULT"
+
+c const
+    // `CURLcode`. Only the ones this package names; `easy_strerror` covers the rest.
+    E_OK:                    i32 = "CURLE_OK"
+    E_UNSUPPORTED_PROTOCOL:  i32 = "CURLE_UNSUPPORTED_PROTOCOL"
+    E_URL_MALFORMAT:         i32 = "CURLE_URL_MALFORMAT"
+    E_COULDNT_RESOLVE_HOST:  i32 = "CURLE_COULDNT_RESOLVE_HOST"
+    E_COULDNT_CONNECT:       i32 = "CURLE_COULDNT_CONNECT"
+    E_OUT_OF_MEMORY:         i32 = "CURLE_OUT_OF_MEMORY"
+    E_OPERATION_TIMEDOUT:    i32 = "CURLE_OPERATION_TIMEDOUT"
+    E_TOO_MANY_REDIRECTS:    i32 = "CURLE_TOO_MANY_REDIRECTS"
+    E_PEER_FAILED_VERIFICATION: i32 = "CURLE_PEER_FAILED_VERIFICATION"
+    E_SSL_CONNECT_ERROR:     i32 = "CURLE_SSL_CONNECT_ERROR"
+    E_GOT_NOTHING:           i32 = "CURLE_GOT_NOTHING"
+    E_SEND_ERROR:            i32 = "CURLE_SEND_ERROR"
+    E_RECV_ERROR:            i32 = "CURLE_RECV_ERROR"
+    E_WRITE_ERROR:           i32 = "CURLE_WRITE_ERROR"
+    E_UNKNOWN_OPTION:        i32 = "CURLE_UNKNOWN_OPTION"
+    E_HTTP_RETURNED_ERROR:   i32 = "CURLE_HTTP_RETURNED_ERROR"
+    E_ABORTED_BY_CALLBACK:   i32 = "CURLE_ABORTED_BY_CALLBACK"
+
+c const
+    // The options this package sets. One line per typed wrapper in `easy.sysl`.
+    O_URL:              i32 = "CURLOPT_URL"
+    O_WRITEFUNCTION:    i32 = "CURLOPT_WRITEFUNCTION"
+    O_WRITEDATA:        i32 = "CURLOPT_WRITEDATA"
+    O_HEADERFUNCTION:   i32 = "CURLOPT_HEADERFUNCTION"
+    O_HEADERDATA:       i32 = "CURLOPT_HEADERDATA"
+    O_READFUNCTION:     i32 = "CURLOPT_READFUNCTION"
+    O_READDATA:         i32 = "CURLOPT_READDATA"
+    O_FOLLOWLOCATION:   i32 = "CURLOPT_FOLLOWLOCATION"
+    O_MAXREDIRS:        i32 = "CURLOPT_MAXREDIRS"
+    O_TIMEOUT_MS:       i32 = "CURLOPT_TIMEOUT_MS"
+    O_CONNECTTIMEOUT_MS: i32 = "CURLOPT_CONNECTTIMEOUT_MS"
+    O_USERAGENT:        i32 = "CURLOPT_USERAGENT"
+    O_HTTPHEADER:       i32 = "CURLOPT_HTTPHEADER"
+    O_CUSTOMREQUEST:    i32 = "CURLOPT_CUSTOMREQUEST"
+    O_POST:             i32 = "CURLOPT_POST"
+    // **`COPYPOSTFIELDS`, never `POSTFIELDS`.** The plain one keeps the caller's pointer rather
+    // than copying, so a body that goes out of scope before `perform` is read after it is gone --
+    // and it reads correctly often enough to pass a test. The copying one costs one allocation per
+    // request and removes the whole question. It reads `POSTFIELDSIZE_LARGE` if that was set first
+    // and calls `strlen` if it was not, which is why the size is always set first here.
+    O_COPYPOSTFIELDS:   i32 = "CURLOPT_COPYPOSTFIELDS"
+    O_POSTFIELDSIZE_LARGE: i32 = "CURLOPT_POSTFIELDSIZE_LARGE"
+    O_NOBODY:           i32 = "CURLOPT_NOBODY"
+    O_UPLOAD:           i32 = "CURLOPT_UPLOAD"
+    O_INFILESIZE_LARGE: i32 = "CURLOPT_INFILESIZE_LARGE"
+    O_ACCEPT_ENCODING:  i32 = "CURLOPT_ACCEPT_ENCODING"
+    O_PROXY:            i32 = "CURLOPT_PROXY"
+    O_CAINFO:           i32 = "CURLOPT_CAINFO"
+    O_CAPATH:           i32 = "CURLOPT_CAPATH"
+    O_SSL_VERIFYPEER:   i32 = "CURLOPT_SSL_VERIFYPEER"
+    O_SSL_VERIFYHOST:   i32 = "CURLOPT_SSL_VERIFYHOST"
+    O_HTTP_VERSION:     i32 = "CURLOPT_HTTP_VERSION"
+    O_USERPWD:          i32 = "CURLOPT_USERPWD"
+    O_PRIVATE:          i32 = "CURLOPT_PRIVATE"
+    O_FAILONERROR:      i32 = "CURLOPT_FAILONERROR"
+    O_NOSIGNAL:         i32 = "CURLOPT_NOSIGNAL"
+    O_PATH_AS_IS:       i32 = "CURLOPT_PATH_AS_IS"
+    O_COOKIEFILE:       i32 = "CURLOPT_COOKIEFILE"
+    O_COOKIE:           i32 = "CURLOPT_COOKIE"
+
+c const
+    // What `getinfo` answers about a finished transfer.
+    I_RESPONSE_CODE:  i32 = "CURLINFO_RESPONSE_CODE"
+    I_CONTENT_TYPE:   i32 = "CURLINFO_CONTENT_TYPE"
+    I_EFFECTIVE_URL:  i32 = "CURLINFO_EFFECTIVE_URL"
+    I_SIZE_DOWNLOAD:  i32 = "CURLINFO_SIZE_DOWNLOAD_T"
+    I_SIZE_UPLOAD:    i32 = "CURLINFO_SIZE_UPLOAD_T"
+    I_TOTAL_TIME_US:  i32 = "CURLINFO_TOTAL_TIME_T"
+    I_REDIRECT_COUNT: i32 = "CURLINFO_REDIRECT_COUNT"
+    I_PRIVATE:        i32 = "CURLINFO_PRIVATE"
+    I_HTTP_VERSION:   i32 = "CURLINFO_HTTP_VERSION"
+
+c const
+    // What `CURLOPT_HTTP_VERSION` takes. **`2TLS` is the one to want by default**: HTTP/2 where the
+    // server offers it over TLS by ALPN, and HTTP/1.1 otherwise, which never fails for asking.
+    HTTP_VERSION_1_1:   long = "CURL_HTTP_VERSION_1_1"
+    HTTP_VERSION_2TLS:  long = "CURL_HTTP_VERSION_2TLS"
+    HTTP_VERSION_NONE:  long = "CURL_HTTP_VERSION_NONE"

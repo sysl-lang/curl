@@ -1,0 +1,439 @@
+module sh.sysl.curl
+@tests
+
+// The half a live host cannot test.
+//
+// **`https://example.com/` proves TLS, DNS and a 200, and it cannot be made to send anything
+// else.** A 404 with a body, a redirect chain, a header in an unexpected case, a body with a zero
+// byte in it, a `Content-Length` that lies -- each of those is what the binding actually has to get
+// right, and each needs a server that will send exactly the bytes a test names. So the tests here
+// stand one up on a loopback port.
+//
+// **The server answers one request and closes**, which is all any of these needs and leaves no
+// shutdown protocol to get wrong.
+
+import sh.sysl.curl.c
+import sysl.buf.{Buf, buf}
+import sysl.harness.*
+import sysl.posix.net.{resolve, resolve_passive, socket, Socket}
+import sysl.posix.threads.{spawn, Thread}
+import sysl.slices.as_ptr
+import sysl.sync.Atomic
+import sysl.text.{from_utf8_unchecked, Search}
+
+// What one canned server needs to know. **A `*Job` crosses to the other thread**, so it holds a raw
+// pointer to the reply rather than a slice: a view owns its elements through a count that is not
+// atomic, and a struct with one in it may not cross a domain.
+private struct Job
+    // **Asked for as 0 and read back after `bind`.** A test that names its own port fails whenever
+    // anything else on the machine happens to hold it, and the failure does not look like a port
+    // collision -- this suite lost time to a listener another project had orphaned six days
+    // earlier, which surfaced as libcurl answering `CURLE_UNSUPPORTED_PROTOCOL`.
+    port: Atomic[int]
+    reply: *u8
+    len: usize
+    ready: Atomic[int]
+
+    // Raised by the test when it is done, so a server that is deliberately not answering knows when
+    // to let go. **Spun on rather than slept on because the library has no `sleep`** -- card 0400.
+    release: Atomic[int]
+    request: [2048]u8
+    request_len: usize
+
+// Serve exactly one connection, then close both sockets and return.
+private serve(j: *Job)
+    val addrs = resolve_passive(0).unwrap()
+    var lis = socket(addrs[0]).unwrap()
+
+    lis.reuse_address(true).unwrap()
+    lis.bind(addrs[0]).unwrap()
+    lis.listen(1).unwrap()
+
+    j.port.store(lis.local().unwrap().port())
+
+    // Only now is the port actually accepting, which is what the client waits for.
+    j.ready.store(1)
+
+    val pair = lis.accept().unwrap()
+    var conn = pair.0
+
+    j.request_len = conn.recv(j.request[0..<2048]).unwrap_or(0)
+
+    // **An empty reply means hold the connection open and answer nothing**, which is what a client
+    // timeout has to be tested against: a server that closes produces an empty-response error
+    // instead, and a connect timeout never fires because the connection succeeded.
+    if j.len == 0
+        while j.release.load() == 0
+            ()
+    else
+        conn.send_all(j.reply[0..<j.len]).unwrap_or(())
+
+    conn.close().unwrap_or(())
+    lis.close().unwrap_or(())
+
+// Start a server on `port` that answers `reply`, and wait until it is listening.
+//
+// **Waiting on the flag rather than sleeping is the difference between a test and a flake**: a
+// `connect` issued before `listen` is refused, and on a loaded machine that race is won by the
+// client often enough to matter.
+private serving(reply: []const u8) -> (&Job, Thread)
+    var j: &Job = Job(Atomic(0), as_ptr(reply), reply.len, Atomic(0), Atomic(0), [0; 2048], 0)
+    val t = spawn(&serve, &*j).unwrap()
+
+    while j.ready.load() == 0
+        ()
+
+    (j, t)
+
+// A client pointed at a loopback port, with the timeouts a test wants rather than a program's.
+private local_client() -> &Client
+    init().unwrap()
+
+    val cl = client().unwrap()
+
+    cl.timeout_ms(5000).unwrap()
+    cl.connect_timeout_ms(2000).unwrap()
+    cl
+
+private url_for(j: &Job, path: string) -> string = "http://127.0.0.1:" + str(j.port.load()) + path
+
+@test("a 200 with a body arrives whole, with its status, headers and text")
+plain_200()
+    val reply = ("HTTP/1.1 200 OK\r\n" +
+                 "Content-Type: text/plain\r\n" +
+                 "Content-Length: 5\r\n" +
+                 "Connection: close\r\n\r\nhello").bytes
+    val pair = serving(reply)
+    val cl = local_client()
+    val r = cl.get(url_for(pair.0, "/")).unwrap()
+
+    assert_eq(r.status, 200)
+    assert(r.ok())
+    assert_eq(r.text(), "hello")
+    assert_eq(r.header("content-type").unwrap_or(""), "text/plain")
+    assert_eq(r.body.len(), 5)
+
+    pair.1.join()
+
+@test("a 404 is a Response rather than an Err, and its body is delivered")
+error_body()
+    val reply = ("HTTP/1.1 404 Not Found\r\n" +
+                 "Content-Type: application/json\r\n" +
+                 "Content-Length: 21\r\n" +
+                 "Connection: close\r\n\r\n{\"error\":\"not found\"}").bytes
+    val pair = serving(reply)
+    val cl = local_client()
+    val r = cl.get(url_for(pair.0, "/missing")).unwrap()
+
+    // **This is the reason `fail_on_error` is off by default.** The body says what was wrong, and
+    // libcurl does not hand it over when the option is on.
+    assert_eq(r.status, 404)
+    assert(!r.ok())
+    assert_eq(r.text(), "{\"error\":\"not found\"}")
+
+    pair.1.join()
+
+@test("a header is found whatever case the server sent it in")
+header_case()
+    val reply = ("HTTP/1.1 200 OK\r\n" +
+                 "CoNtEnT-tYpE: text/html\r\n" +
+                 "X-RATE-LIMIT: 42\r\n" +
+                 "Content-Length: 2\r\n\r\nhi").bytes
+    val pair = serving(reply)
+    val cl = local_client()
+    val r = cl.get(url_for(pair.0, "/")).unwrap()
+
+    assert_eq(r.header("content-type").unwrap_or(""), "text/html")
+    assert_eq(r.header("x-rate-limit").unwrap_or(""), "42")
+
+    pair.1.join()
+
+@test("a body carrying a zero byte is delivered whole, not truncated at it")
+binary_body()
+    var reply: Buf[u8] = buf()
+
+    reply.extend("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".bytes)
+    reply.push(1)
+    reply.push(0)
+    reply.push(2)
+    reply.push(0)
+    reply.push(3)
+
+    val pair = serving(reply.view())
+    val cl = local_client()
+    val r = cl.get(url_for(pair.0, "/")).unwrap()
+
+    // A binding that measured the body with `strlen` answers 1 here.
+    assert_eq(r.body.len(), 5)
+    assert_eq(r.body.at(1), 0)
+    assert_eq(r.body.at(4), 3)
+
+    pair.1.join()
+
+@test("a request header the caller added reaches the server")
+sends_headers()
+    val reply = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".bytes
+    val pair = serving(reply)
+    val cl = local_client()
+    var hs = headers()
+
+    hs.add("X-Trace", "abc123").unwrap()
+
+    val r = cl.get(url_for(pair.0, "/"), Some(hs)).unwrap()
+
+    assert_eq(r.status, 204)
+
+    val sent = from_utf8_unchecked(pair.0.request[0..<pair.0.request_len])
+
+    assert(sent.contains("X-Trace: abc123"))
+
+    pair.1.join()
+
+@test("a POST sends its body, and libcurl copied it")
+post_body()
+    val reply = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".bytes
+    val pair = serving(reply)
+    val cl = local_client()
+    val r = cl.post(url_for(pair.0, "/items"), "{\"a\":1}".bytes).unwrap()
+
+    assert_eq(r.status, 201)
+
+    val sent = from_utf8_unchecked(pair.0.request[0..<pair.0.request_len])
+
+    assert(sent.starts_with("POST /items "))
+    assert(sent.contains("{\"a\":1}"))
+
+    pair.1.join()
+
+@test("a POST body carrying a zero byte is sent whole -- the size goes before COPYPOSTFIELDS")
+post_binary()
+    val reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".bytes
+    val pair = serving(reply)
+    val cl = local_client()
+
+    var body: Buf[u8] = buf()
+
+    body.push(65)
+    body.push(0)
+    body.push(66)
+
+    cl.post(url_for(pair.0, "/"), body.view()).unwrap()
+
+    val sent = from_utf8_unchecked(pair.0.request[0..<pair.0.request_len])
+
+    // `Content-Length: 3`, not `1` -- which is what a `strlen` of the body would have produced.
+    assert(sent.contains("Content-Length: 3"))
+
+    pair.1.join()
+
+@test("a HEAD asks for no body and does not wait for one")
+head_request()
+    val reply = ("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n" +
+                 "Content-Length: 1234\r\nConnection: close\r\n\r\n").bytes
+    val pair = serving(reply)
+    val cl = local_client()
+    val r = cl.head(url_for(pair.0, "/big")).unwrap()
+
+    // **The Content-Length describes a body that is never sent**, which is exactly the case a
+    // parser told to expect one hangs on.
+    assert_eq(r.status, 200)
+    assert_eq(r.body.len(), 0)
+    assert_eq(r.header("content-length").unwrap_or(""), "1234")
+
+    val sent = from_utf8_unchecked(pair.0.request[0..<pair.0.request_len])
+
+    assert(sent.starts_with("HEAD "))
+
+    pair.1.join()
+
+@test("a PUT and a DELETE use their own verbs")
+other_verbs()
+    val reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".bytes
+    val pair = serving(reply)
+    val cl = local_client()
+
+    cl.put(url_for(pair.0, "/thing"), "x".bytes).unwrap()
+
+    assert(from_utf8_unchecked(pair.0.request[0..<pair.0.request_len]).starts_with("PUT /thing "))
+
+    pair.1.join()
+
+    val pair2 = serving(reply)
+    val cl2 = local_client()
+
+    cl2.delete(url_for(pair2.0, "/thing")).unwrap()
+
+    assert(from_utf8_unchecked(pair2.0.request[0..<pair2.0.request_len]).starts_with("DELETE /thing "))
+
+    pair2.1.join()
+
+@test("a custom method is sent as written")
+custom_verb()
+    val reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".bytes
+    val pair = serving(reply)
+    val cl = local_client()
+
+    cl.send(Other("PATCH"), url_for(pair.0, "/r"), "{}".bytes).unwrap()
+
+    assert(from_utf8_unchecked(pair.0.request[0..<pair.0.request_len]).starts_with("PATCH /r "))
+
+    pair.1.join()
+
+@test("a response with no Content-Length ends when the connection does")
+eof_terminated()
+    val reply = ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" +
+                 "Connection: close\r\n\r\nthe body, ended by a close").bytes
+    val pair = serving(reply)
+    val cl = local_client()
+    val r = cl.get(url_for(pair.0, "/")).unwrap()
+
+    assert_eq(r.status, 200)
+    assert_eq(r.text(), "the body, ended by a close")
+
+    pair.1.join()
+
+@test("a chunked body arrives dechunked")
+chunked_body()
+    val reply = ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" +
+                 "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" +
+                 "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n").bytes
+    val pair = serving(reply)
+    val cl = local_client()
+    val r = cl.get(url_for(pair.0, "/")).unwrap()
+
+    // The chunk sizes must not be in the body -- that is libcurl's job and it is the reason to bind
+    // it rather than read the socket.
+    assert_eq(r.text(), "hello world")
+
+    pair.1.join()
+
+@test("a redirect is followed, and only the FINAL response's headers are kept")
+follows_redirect()
+    // A server that answers one connection cannot serve a chain, so the two hops are two servers.
+    // **The second is started first**, because the first one's `Location` has to name its port and
+    // the port is not known until it has bound.
+    val second = ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" +
+                  "Content-Length: 4\r\nConnection: close\r\n\r\ndone").bytes
+    val b = serving(second)
+    val first = ("HTTP/1.1 301 Moved Permanently\r\n" +
+                 "Location: " + url_for(b.0, "/final") + "\r\n" +
+                 "X-From-Redirect: yes\r\n" +
+                 "Content-Length: 0\r\nConnection: close\r\n\r\n").bytes
+    val a = serving(first)
+    val cl = local_client()
+    val r = cl.get(url_for(a.0, "/start")).unwrap()
+
+    assert_eq(r.status, 200)
+    assert_eq(r.text(), "done")
+
+    // **The header from the 301 must be gone.** Without the clear in `on_header` it survives, and a
+    // caller reading `location` gets an answer about a response it no longer has.
+    assert(r.header("x-from-redirect").is_none())
+    assert(r.url.contains("/final"))
+
+    a.1.join()
+    b.1.join()
+
+@test("a redirect is NOT followed when the client says not to")
+redirect_off()
+    val reply = ("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/nowhere\r\n" +
+                 "Content-Length: 0\r\nConnection: close\r\n\r\n").bytes
+    val pair = serving(reply)
+    val cl = local_client()
+
+    cl.follow(false).unwrap()
+
+    val r = cl.get(url_for(pair.0, "/")).unwrap()
+
+    assert_eq(r.status, 302)
+    assert_eq(r.header("location").unwrap_or(""), "http://127.0.0.1:1/nowhere")
+
+    pair.1.join()
+
+@test("fail_on_error turns a 404 into an Err")
+fail_on_error_option()
+    val reply = ("HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n" +
+                 "Connection: close\r\n\r\nno!").bytes
+    val pair = serving(reply)
+    val cl = local_client()
+
+    cl.fail_on_error(true).unwrap()
+
+    cl.get(url_for(pair.0, "/x")) match
+        Ok(_) -> assert(false)
+        Err(e) -> assert_eq(e.code, c.E_HTTP_RETURNED_ERROR)
+
+    pair.1.join()
+
+@test("a user agent the caller set is what the server sees")
+user_agent_option()
+    val reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".bytes
+    val pair = serving(reply)
+    val cl = local_client()
+
+    cl.user_agent("probe/9").unwrap()
+    cl.get(url_for(pair.0, "/")).unwrap()
+
+    assert(from_utf8_unchecked(pair.0.request[0..<pair.0.request_len]).contains("User-Agent: probe/9"))
+
+    pair.1.join()
+
+@test("a timeout is reported as a timeout, and it is transient")
+times_out()
+    // A server that accepts and never answers. **This is what a connect timeout does not catch**,
+    // and the reason the whole-transfer one is the important bound.
+    val reply: []const u8 = []
+    val pair = serving(reply)
+    val cl = local_client()
+
+    cl.timeout_ms(400).unwrap()
+
+    cl.get(url_for(pair.0, "/slow")) match
+        Ok(_) -> assert(false)
+        Err(e) ->
+            assert_eq(e.code, c.E_OPERATION_TIMEDOUT)
+            assert(e.transient())
+
+    pair.0.release.store(1)
+    pair.1.join()
+
+@test("one client reuses its connection across requests, which is why it is a client")
+reuses_handle()
+    // Two requests to two servers through one `Client`: what is being checked is that a handle
+    // survives being used again, since libcurl remembers everything set on it.
+    val reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".bytes
+    val cl = local_client()
+    val a = serving(reply)
+    val r1 = cl.get(url_for(a.0, "/one")).unwrap()
+
+    a.1.join()
+
+    val b = serving(reply)
+    val r2 = cl.get(url_for(b.0, "/two")).unwrap()
+
+    b.1.join()
+
+    assert_eq(r1.text(), "ok")
+    assert_eq(r2.text(), "ok")
+
+    // **The second response must not carry the first's body.** A binding that forgot to clear the
+    // accumulator answers `okok` here.
+    assert_eq(r2.body.len(), 2)
+
+@test("a POST followed by a GET on one client does not send a POST twice")
+verb_is_reset()
+    val reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".bytes
+    val cl = local_client()
+    val a = serving(reply)
+
+    cl.post(url_for(a.0, "/p"), "x".bytes).unwrap()
+    a.1.join()
+
+    val b = serving(reply)
+
+    cl.get(url_for(b.0, "/g")).unwrap()
+    b.1.join()
+
+    // libcurl remembers `CURLOPT_POST`, so a binding that only sets options when they change sends
+    // a second POST here -- with no body, which many servers accept silently.
+    assert(from_utf8_unchecked(b.0.request[0..<b.0.request_len]).starts_with("GET /g "))

@@ -1,0 +1,89 @@
+// Request headers on the way out, and response headers on the way back.
+
+module sh.sysl.curl
+
+import sh.sysl.curl.c
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, to_lower, Search}
+
+/** One response header, as it arrived. The name keeps its original spelling; `Response.header` is
+ * what does the case-insensitive lookup RFC 9110 asks for.
+ */
+struct Header
+    name: string
+    value: string
+
+/** The request headers, as the linked list libcurl takes.
+ *
+ * **It is a `&Headers` because it owns C storage**, and the destructor is what gives it back. A
+ * plain value would be copied and freed twice, or never.
+ */
+struct Headers
+    private head: *c.Slist
+
+    /** Add `name: value`. A name with no value is sent as `name;`, which is how libcurl spells an
+     * empty header, and a name alone with a colon *removes* a header libcurl would otherwise add.
+     */
+    add(*self, name: string, value: string) -> Result[unit, Error]
+        val line = cstring(name + ": " + value)
+        val next = c.slist_append(self.head, line.ptr)
+
+        // **A null answer means the append failed and the old head is still ours.** Overwriting it
+        // would leak the whole list, which is why the field is only written on success.
+        if usize(next) == 0 then return Err(Error(c.E_OUT_OF_MEMORY, "could not extend the header list"))
+
+        self.head = next
+        Ok(())
+
+    /** Stop libcurl sending a header it adds by default -- `Expect`, `Accept`, `Transfer-Encoding`. */
+    remove(*self, name: string) -> Result[unit, Error]
+        val line = cstring(name + ":")
+        val next = c.slist_append(self.head, line.ptr)
+
+        if usize(next) == 0 then return Err(Error(c.E_OUT_OF_MEMORY, "could not extend the header list"))
+
+        self.head = next
+        Ok(())
+
+    private[curl] raw(self) -> *c.Slist = self.head
+end Headers
+
+impl Drop for Headers
+    drop(self) = if usize(self.head) != 0 then c.slist_free_all(self.head)
+
+/** An empty header list.
+ *
+ * **It answers `&Headers` rather than `Headers`, and that is not a style choice**: a destructor runs
+ * when a box's count reaches zero and never for a plain value, so a `Headers` returned unboxed would
+ * leak its list on every call.
+ */
+headers() -> &Headers = Headers(ptr_cast(0usize))
+
+/** Split one header line as libcurl delivers it -- `Name: value\r\n` -- into a pair.
+ *
+ * `None` for the status line, which has no colon, and for the blank line that ends a header block.
+ * **Both arrive through the same callback as real headers**, so skipping them is the caller's job
+ * and this is where it is done.
+ */
+private[curl] parse_header(line: string) -> Option[Header]
+    val cut = line.index_of(":")?
+    var end = line.len
+
+    while end > cut && (line[end - 1..<end] == "\r" || line[end - 1..<end] == "\n")
+        end -= 1
+
+    var start = cut + 1
+
+    while start < end && line[start..<start + 1] == " "
+        start += 1
+
+    Some(Header(line[0..<cut], line[start..<end]))
+
+/** The first header called `name`, matched without regard to case. */
+private[curl] find(hs: []const Header, name: string) -> Option[string]
+    val want = to_lower(name)
+
+    for h in hs
+        if to_lower(h.name) == want then return Some(h.value)
+
+    None

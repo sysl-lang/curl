@@ -1,0 +1,356 @@
+// A client, which is one libcurl easy handle and the connections it has open.
+
+module sh.sysl.curl
+
+import sh.sysl.curl.c
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+import sysl.text.{cstring, from_cstring, from_utf8_unchecked}
+
+/** Which HTTP method. `Other` is for the ones a specification invented -- `PATCH`, `PROPFIND` --
+ * and it is a string because there is no closed set to enumerate.
+ */
+enum Method derives Display
+    Get
+    Head
+    Post
+    Put
+    Delete
+    Other(name: string)
+
+/** What a finished transfer answered. */
+struct Response
+    /** The HTTP status. `0` where the transfer finished without one, which HTTP cannot do and other
+     * protocols can.
+     */
+    status: int
+
+    /** Every response header of the **final** response, in arrival order. A redirect that was
+     * followed contributes its own block first and those are dropped -- see `Client.follow`.
+     */
+    headers: Buf[Header]
+
+    /** The body, exactly as it arrived, after any `Content-Encoding` libcurl was asked to undo. */
+    body: Buf[u8]
+
+    /** Where the response actually came from, which differs from the request URL after a redirect. */
+    url: string
+
+    /** How long the whole transfer took, in microseconds. */
+    micros: i64
+
+    /** The first header called `name`, matched without regard to case. */
+    header(self, name: string) -> Option[string] = find(self.headers.view(), name)
+
+    /** The body as text. **It is not checked for being UTF-8**, because a response body is whatever
+     * the server sent and a client that refused to show you a malformed one would be worse than the
+     * server that sent it. Use `body` where the bytes matter.
+     */
+    text(self) -> string = from_utf8_unchecked(self.body.view())
+
+    /** Whether the status is 2xx. */
+    ok(self) -> bool = self.status >= 200 && self.status < 300
+end Response
+
+/** A client. **One of these is one libcurl easy handle**, so requests made through it in turn reuse
+ * the connection, the TLS session and the DNS answer -- which is most of the reason to use libcurl
+ * rather than write a client.
+ *
+ * **It is not safe to share between threads**, exactly as a libcurl easy handle is not. One per
+ * thread is the arrangement libcurl documents and this inherits it.
+ *
+ * **It is a `&Client` for two reasons that happen to agree.** libcurl hands a callback the pointer
+ * it was given and nothing else, so the value that pointer names must not move; and the handle has
+ * a destructor, which only runs for a box.
+ *
+ * **It does NOT hold a reference to itself, and the difference from `sh.sysl.libuv` is worth
+ * knowing.** A libuv handle keeps one because its callbacks fire at an arbitrary later moment, so
+ * something has to stop the box dying in between. libcurl's fire only from inside `perform`, which
+ * the caller is in the middle of calling — so the caller's own reference is what keeps the box
+ * alive, and a self-reference would be a cycle that counting cannot collect. Written that way
+ * first: 10,000 clients grew the resident set to 143 MB, and no test noticed.
+ */
+struct Client
+    private h: *c.Easy
+
+    // Filled by the callbacks during `perform`, and cleared at the start of each request.
+    private body: Buf[u8]
+    private head_lines: Buf[Header]
+
+    // libcurl copies every string option it is given except the post body, which is why nothing
+    // here has to outlive the call that set it -- and why the body is set with `COPYPOSTFIELDS`.
+    private ua: string
+
+    /** Send a request and read the whole response into memory.
+     *
+     * **The whole response.** A body larger than the machine can hold is a body this refuses to
+     * handle; `limit` is what stops one, and it is not optional in the sense that matters -- a
+     * client with no limit is one response away from being over.
+     */
+    send(&self, m: Method, url: string, body: []const u8 = [],
+         hs: Option[&Headers] = None) -> Result[Response, Error]
+        self.body.clear()
+        self.head_lines.clear()
+
+        val u = cstring(url)
+
+        told(c.setopt(self.h, c.O_URL, u.ptr))?
+
+        self.method(m, body)?
+
+        hs match
+            Some(list) -> told(c.setopt(self.h, c.O_HTTPHEADER, list.raw()))?
+            None ->
+                val none: *c.Slist = ptr_cast(0usize)
+
+                told(c.setopt(self.h, c.O_HTTPHEADER, none))?
+
+        told(c.easy_perform(self.h))?
+
+        var code: long = 0
+        var eff: *u8 = ptr_cast(0usize)
+        var us: i64 = 0
+
+        told(c.getinfo(self.h, c.I_RESPONSE_CODE, &code))?
+        told(c.getinfo(self.h, c.I_EFFECTIVE_URL, &eff))?
+        told(c.getinfo(self.h, c.I_TOTAL_TIME_US, &us))?
+
+        Ok(Response(int(code), self.head_lines, self.body,
+                    from_cstring(eff).unwrap_or(url), us))
+
+    /** `GET url`. */
+    get(&self, url: string, hs: Option[&Headers] = None) -> Result[Response, Error] =
+        self.send(Get, url, [], hs)
+
+    /** `HEAD url` -- the headers, and no body. */
+    head(&self, url: string, hs: Option[&Headers] = None) -> Result[Response, Error] =
+        self.send(Head, url, [], hs)
+
+    /** `POST url` with `body`. **libcurl copies the body**, so it need not outlive this call. */
+    post(&self, url: string, body: []const u8,
+         hs: Option[&Headers] = None) -> Result[Response, Error] = self.send(Post, url, body, hs)
+
+    /** `PUT url` with `body`. */
+    put(&self, url: string, body: []const u8,
+        hs: Option[&Headers] = None) -> Result[Response, Error] = self.send(Put, url, body, hs)
+
+    /** `DELETE url`. */
+    delete(&self, url: string, hs: Option[&Headers] = None) -> Result[Response, Error] =
+        self.send(Delete, url, [], hs)
+
+    // Put the handle into the shape one method wants. **Every one of these is set on every request**
+    // rather than only when it changes, because a handle is reused and libcurl remembers: a `POST`
+    // followed by a `GET` that did not clear `CURLOPT_POST` sends a POST with no body.
+    private method(&self, m: Method, body: []const u8) -> Result[unit, Error]
+        told(c.setopt(self.h, c.O_POST, long(0)))?
+        told(c.setopt(self.h, c.O_NOBODY, long(0)))?
+        told(c.setopt(self.h, c.O_UPLOAD, long(0)))?
+        val default_verb: *u8 = ptr_cast(0usize)
+
+        told(c.setopt(self.h, c.O_CUSTOMREQUEST, default_verb))?
+
+        m match
+            Get -> Ok(())
+            Head -> told(c.setopt(self.h, c.O_NOBODY, long(1)))
+            Post ->
+                told(c.setopt(self.h, c.O_POST, long(1)))?
+                self.write_body(body)
+            Put ->
+                val name = cstring("PUT")
+
+                told(c.setopt(self.h, c.O_CUSTOMREQUEST, name.ptr))?
+                self.write_body(body)
+            Delete ->
+                val name = cstring("DELETE")
+
+                told(c.setopt(self.h, c.O_CUSTOMREQUEST, name.ptr))?
+
+                if body.len > 0 then self.write_body(body) else Ok(())
+            Other(name) ->
+                val n = cstring(name)
+
+                told(c.setopt(self.h, c.O_CUSTOMREQUEST, n.ptr))?
+
+                if body.len > 0 then self.write_body(body) else Ok(())
+
+    // **The size goes first.** `COPYPOSTFIELDS` reads `POSTFIELDSIZE_LARGE` if it has been set and
+    // calls `strlen` on the pointer if it has not -- so a body with a zero byte in it is truncated
+    // by a binding that sets them the other way round, and every test with a text body passes.
+    private write_body(&self, body: []const u8) -> Result[unit, Error]
+        told(c.setopt(self.h, c.O_POSTFIELDSIZE_LARGE, i64(body.len)))?
+
+        val p: *u8 = if body.len == 0 then ptr_cast(1usize) else ptr_cast(as_ptr(body))
+
+        told(c.setopt(self.h, c.O_COPYPOSTFIELDS, p))
+
+    // ## The options a caller changes after `client()` has set the defaults
+    //
+    // **One typed method per option, rather than a generic `setopt`.** `curl_easy_setopt` is
+    // variadic and takes 291 options whose third argument is a `long`, a string, a pointer, a
+    // callback or a 64-bit offset depending on which one it is -- so a generic wrapper would accept
+    // a string where libcurl reads a number and answer `CURLE_OK` having stored a pointer. The type
+    // is the whole value of this layer.
+    //
+    // **What is here is what the package needed**, and adding to it is ordinary work: the rule is
+    // that each one is faithful to what libcurl documents, not that all 291 are present.
+
+    /** How long the whole transfer may take, in milliseconds. Zero is no limit.
+     *
+     * **This is the one that bounds a request**, and a connect timeout is not a substitute: a server
+     * that accepts the connection and then sends a byte a minute is inside every connect timeout
+     * there is.
+     */
+    timeout_ms(&self, ms: int) -> Result[unit, Error] =
+        told(c.setopt(self.h, c.O_TIMEOUT_MS, long(ms)))
+
+    /** How long the connection alone may take, in milliseconds. */
+    connect_timeout_ms(&self, ms: int) -> Result[unit, Error] =
+        told(c.setopt(self.h, c.O_CONNECTTIMEOUT_MS, long(ms)))
+
+    /** Whether to follow a redirect, and how many. **The bound is the point**: `0` for `max` with
+     * `on` set is an unbounded chain, and a server that redirects to itself is then a hang rather
+     * than an error.
+     */
+    follow(&self, on: bool = true, max: int = 10) -> Result[unit, Error]
+        told(c.setopt(self.h, c.O_FOLLOWLOCATION, long(if on then 1 else 0)))?
+        told(c.setopt(self.h, c.O_MAXREDIRS, long(max)))
+
+    /** The `User-Agent` header. */
+    user_agent(&self, ua: string) -> Result[unit, Error]
+        val s = cstring(ua)
+
+        told(c.setopt(self.h, c.O_USERAGENT, s.ptr))
+
+    /** Which HTTP version to try. The default is `Http2Tls`, which asks for HTTP/2 over TLS by ALPN
+     * and falls back to 1.1 without failing.
+     */
+    http_version(&self, v: HttpVersion) -> Result[unit, Error] =
+        told(c.setopt(self.h, c.O_HTTP_VERSION, v match
+            Http1_1 -> c.HTTP_VERSION_1_1
+            Http2Tls -> c.HTTP_VERSION_2TLS
+            Whatever -> c.HTTP_VERSION_NONE))
+
+    /** Send `user:password` using HTTP Basic. **Over `http://` this is the password in clear**, and
+     * nothing here checks the scheme.
+     */
+    basic_auth(&self, user: string, password: string) -> Result[unit, Error]
+        val s = cstring(user + ":" + password)
+
+        told(c.setopt(self.h, c.O_USERPWD, s.ptr))
+
+    /** Route through a proxy — `http://host:port`, or a `socks5://` URL. An empty string is none. */
+    proxy(&self, url: string) -> Result[unit, Error]
+        val s = cstring(url)
+
+        told(c.setopt(self.h, c.O_PROXY, s.ptr))
+
+    /** Trust the authorities in this PEM bundle *instead of* the machine's store. */
+    ca_bundle(&self, path: string) -> Result[unit, Error]
+        val s = cstring(path)
+
+        told(c.setopt(self.h, c.O_CAINFO, s.ptr))
+
+    /** Turn a `4xx`/`5xx` into an `Err` from `send` rather than a `Response` carrying the status.
+     *
+     * **Off by default, and that is deliberate**: an error response usually has a body saying what
+     * was wrong, and libcurl does not hand it to you when this is on.
+     */
+    fail_on_error(&self, on: bool = true) -> Result[unit, Error] =
+        told(c.setopt(self.h, c.O_FAILONERROR, long(if on then 1 else 0)))
+
+    /** Turn certificate verification **off**.
+     *
+     * **This makes TLS decorative** — any certificate is accepted, so anything on the path can read
+     * and rewrite the traffic, and the connection still says `https`. It exists because a test
+     * against a self-signed server needs it and the alternative is people reaching for `curl` in a
+     * subprocess. **Prefer `ca_bundle` for a private authority**, which keeps verification on.
+     */
+    danger_accept_invalid_certs(&self, on: bool) -> Result[unit, Error]
+        told(c.setopt(self.h, c.O_SSL_VERIFYPEER, long(if on then 0 else 1)))?
+        told(c.setopt(self.h, c.O_SSL_VERIFYHOST, long(if on then 0 else 2)))
+end Client
+
+// ## The callbacks
+//
+// Both are ordinary functions rather than closures, because a `CURLOPT_*FUNCTION` takes a C
+// function pointer. Each finds its way back to the `Client` through the pointer libcurl was handed
+// in the matching `*DATA` option -- which is the `&Client` box's address, and a box does not move.
+
+private on_body(p: *u8, size: usize, nmemb: usize, user: *u8) -> usize
+    val n = size * nmemb
+    val s: *Client = ptr_cast(user)
+
+    s.body.extend(p[0..<n])
+    n
+
+// **A redirect that was followed delivers its own header block first**, and libcurl signals the
+// boundary by delivering the next status line. Clearing on a line with no colon is what keeps only
+// the final response's headers -- without it a `Location` from the 301 outlives the 200 that
+// replaced it, and `header("location")` answers about a response that is no longer the one you have.
+private on_header(p: *u8, size: usize, nmemb: usize, user: *u8) -> usize
+    val n = size * nmemb
+    val s: *Client = ptr_cast(user)
+    val line = from_utf8_unchecked(p[0..<n])
+
+    parse_header(line) match
+        Some(h) -> s.head_lines.push(h)
+        None -> if line.len > 5 && line[0..<5] == "HTTP/" then s.head_lines.clear()
+
+    n
+
+/** A client, ready to make requests.
+ *
+ * **`init()` must have been called first**, once, by the program. See its own note: libcurl says so
+ * and no library function can promise it.
+ *
+ * The defaults are the ones a program calling an API wants and would otherwise have to remember:
+ * redirects followed to a bound of 10, a 30-second whole-transfer timeout, every
+ * `Content-Encoding` libcurl can undo offered and undone, HTTP/2 where the server offers it, and
+ * no signals — which is what makes the handle safe to use from a thread.
+ */
+client(user_agent: string = "sysl-curl/0.1") -> Result[&Client, Error]
+    val h = c.easy_init()
+
+    if usize(h) == 0 then return Err(Error(c.E_OUT_OF_MEMORY, "libcurl could not make a handle"))
+
+    var cl: &Client = Client(h, buf(), buf(), user_agent)
+    val here: *u8 = ptr_cast(&*cl)
+
+    // See card 0399: a `*extern` cannot be passed to a variadic parameter, so the signature is
+    // erased through `ptr_cast` here and checked by nothing. Restore `&on_body` when it lands.
+    val body_fn: *u8 = ptr_cast(&on_body)
+    val head_fn: *u8 = ptr_cast(&on_header)
+    val ua = cstring(user_agent)
+    val encodings = cstring("")
+
+    told(c.setopt(h, c.O_WRITEFUNCTION, body_fn))?
+    told(c.setopt(h, c.O_WRITEDATA, here))?
+    told(c.setopt(h, c.O_HEADERFUNCTION, head_fn))?
+    told(c.setopt(h, c.O_HEADERDATA, here))?
+    told(c.setopt(h, c.O_USERAGENT, ua.ptr))?
+    told(c.setopt(h, c.O_FOLLOWLOCATION, long(1)))?
+    told(c.setopt(h, c.O_MAXREDIRS, long(10)))?
+    told(c.setopt(h, c.O_TIMEOUT_MS, long(30000)))?
+    told(c.setopt(h, c.O_CONNECTTIMEOUT_MS, long(10000)))?
+
+    // An empty string means "every encoding this libcurl was built with", and libcurl undoes it
+    // before the write callback sees a byte.
+    told(c.setopt(h, c.O_ACCEPT_ENCODING, encodings.ptr))?
+
+    told(c.setopt(h, c.O_HTTP_VERSION, c.HTTP_VERSION_2TLS))?
+
+    // **Without this libcurl may use SIGALRM for the resolver timeout**, which is not safe in a
+    // program with more than one thread and is the default nobody expects.
+    told(c.setopt(h, c.O_NOSIGNAL, long(1)))?
+
+    Ok(cl)
+
+impl Drop for Client
+    drop(self) = c.easy_cleanup(self.h)
+
+
+/** Which HTTP version a client should try for. */
+enum HttpVersion derives Display
+    Http1_1
+    Http2Tls
+    Whatever

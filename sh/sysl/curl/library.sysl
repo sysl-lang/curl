@@ -1,0 +1,32 @@
+// The library itself: the one call a program owes libcurl, and what it can be asked about.
+
+module sh.sysl.curl
+
+import sh.sysl.curl.c
+import sysl.text.from_cstring
+
+/** Set libcurl up. **Call this once, from the program, before anything else touches this package.**
+ *
+ * **It cannot be done for you, and that is libcurl's rule rather than a gap here.**
+ * `curl_global_init` is documented as not thread-safe and as having to run before any other libcurl
+ * call; a library function reached through `client()` has no way to know whether another thread is
+ * already in one. So this is an entry point the program calls by contract — the same arrangement
+ * `sysl.posix.tty` describes for `setvbuf`.
+ *
+ * **Recent libcurl will initialize itself lazily if you forget**, which is exactly what makes this
+ * dangerous to leave out: a single-threaded program works, and the same code grows a second thread
+ * and fails in a way that has nothing to do with the change.
+ */
+init() -> Result[unit, Error] = told(c.global_init(c.GLOBAL_DEFAULT))
+
+/** Give back what `init` set up. A program that is about to exit need not bother; one that is
+ * unloading a plugin does. **Nothing this package made may be alive when it is called.**
+ */
+shutdown() = c.global_cleanup()
+
+/** libcurl's own version banner — `libcurl/8.7.1 SecureTransport (LibreSSL/3.3.6) …`.
+ *
+ * **Worth printing in a bug report**, because which TLS backend and which HTTP/2 library are in
+ * there is the platform's decision rather than this package's, and it changes what a failure means.
+ */
+version() -> string = from_cstring(c.version()).unwrap_or("unknown")
