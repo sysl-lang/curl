@@ -47,31 +47,47 @@ faithful, not that it is complete.
 
 ## Requirements
 
-libcurl and its headers, found by pkg-config. **macOS already has it**; nothing to install.
+libcurl and its headers, found by pkg-config. **macOS already has one**; see the section below for
+why you may want the other.
 
 ```
 sudo apt install libcurl4-openssl-dev     # Debian / Ubuntu
 sudo pacman -S curl                       # Arch
+brew install curl                         # macOS, optional — see below
 ```
 
-## ⚠ It brings a second TLS stack, and you should know before you use it
+## macOS has TWO libcurls, and which one you get decides whether you have two TLS stacks
 
-**A program that uses this package *and* `sh.sysl.openssl` loads two TLS implementations.** This is
-a property of libcurl on the platform, not of the binding, and nothing warns about it at build time.
-On this machine:
+**This matters more than it sounds and it is not visible at build time.** Checked on macOS 26,
+2026-09-01:
 
-| | what it loads |
-|---|---|
-| `sh.sysl.openssl` | Homebrew OpenSSL 3 — `libssl.3`, `libcrypto.3` |
-| system libcurl | SecureTransport, plus Apple's LibreSSL as `libcrypto.46` and `libssl.48` |
+| | version | TLS | how it is reached |
+|---|---|---|---|
+| **system** | libcurl/8.7.1 | SecureTransport + LibreSSL 3.3.6 | what a bare `pkg-config` answers — the default |
+| **Homebrew** | libcurl/8.21.0 | **OpenSSL 3.6.4** | keg-only, so you must ask for it |
 
-`curl --version` prints which backend yours has, and `dyld_info -dependents` (or `ldd`) shows the
-rest. Two `libssl` and two `libcrypto` at incompatible major versions in one address space is a
-thing the platform permits; whether it is a thing you want is a decision, and it should be made
-knowingly. The same applies to `sh.sysl.nghttp2` beside libcurl's own HTTP/2 library.
+The suite passes against both. What differs is what else ends up in your process.
 
-**If you use only this package, none of that matters** — one TLS stack, the platform's, and it is
-the one `curl(1)` uses.
+**The system one brings a second TLS stack** if your program also uses `sh.sysl.openssl`: two
+`libssl` and two `libcrypto` at incompatible major versions in one address space, plus Apple's
+nghttp2 beside `sh.sysl.nghttp2`'s. The platform permits it; whether you want it is a decision.
+
+**The Homebrew one does not, because it links exactly the same libraries the org's other bindings
+do** — `/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib`, `libcrypto.3.dylib` and
+`/opt/homebrew/opt/libnghttp2/lib/libnghttp2.14.dylib`. One OpenSSL, one nghttp2, shared. It is also
+four years newer and carries HTTP/3 (ngtcp2), brotli, zstd and libssh2.
+
+```
+brew install curl
+PKG_CONFIG_PATH=/opt/homebrew/opt/curl/lib/pkgconfig sysl build .
+```
+
+**So: use the system one if this is the only thing in your program that speaks TLS, and Homebrew's
+if it is not.** `curl --version` prints the backend, and `dyld_info -dependents <binary>` (or `ldd`)
+shows what you actually ended up with — which is the only way to be sure, since nothing warns.
+
+**On Linux this question does not arise**: there is one libcurl, and the distribution built it
+against the same OpenSSL as everything else.
 
 ## `init()` first, once, from the program
 
@@ -154,7 +170,7 @@ ordinary work to add when something needs it.
 sysl test .
 ```
 
-35 tests, no network. **Every test that needs a server starts one** on a loopback port the operating
+35 tests, no network — and they pass against both libcurls named above. **Every test that needs a server starts one** on a loopback port the operating
 system chooses, because a live host cannot be made to send a 404 with a body, a redirect chain, a
 header in an unexpected case, a body with a zero byte in it, or nothing at all — and those are the
 cases the binding has to get right.
