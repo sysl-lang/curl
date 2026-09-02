@@ -316,16 +316,12 @@ client(user_agent: string = "sysl-curl/0.1") -> Result[&Client, Error]
     var cl: &Client = Client(h, buf(), buf(), user_agent)
     val here: *u8 = ptr_cast(&*cl)
 
-    // See card 0399: a `*extern` cannot be passed to a variadic parameter, so the signature is
-    // erased through `ptr_cast` here and checked by nothing. Restore `&on_body` when it lands.
-    val body_fn: *u8 = ptr_cast(&on_body)
-    val head_fn: *u8 = ptr_cast(&on_header)
     val ua = cstring(user_agent)
     val encodings = cstring("")
 
-    told(c.setopt(h, c.O_WRITEFUNCTION, body_fn))?
+    told(c.setopt(h, c.O_WRITEFUNCTION, &on_body))?
     told(c.setopt(h, c.O_WRITEDATA, here))?
-    told(c.setopt(h, c.O_HEADERFUNCTION, head_fn))?
+    told(c.setopt(h, c.O_HEADERFUNCTION, &on_header))?
     told(c.setopt(h, c.O_HEADERDATA, here))?
     told(c.setopt(h, c.O_USERAGENT, ua.ptr))?
     told(c.setopt(h, c.O_FOLLOWLOCATION, long(1)))?

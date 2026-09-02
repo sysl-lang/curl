@@ -17,9 +17,11 @@ import sysl.buf.{Buf, buf}
 import sysl.harness.*
 import sysl.posix.net.{resolve, resolve_passive, socket, Socket}
 import sysl.posix.threads.{spawn, Thread}
+import sysl.posix.time.sleep
 import sysl.slices.as_ptr
 import sysl.sync.Atomic
 import sysl.text.{from_utf8_unchecked, Search}
+import sysl.time.DurationUnits
 
 // What one canned server needs to know. **A `*Job` crosses to the other thread**, so it holds a raw
 // pointer to the reply rather than a slice: a view owns its elements through a count that is not
@@ -35,7 +37,8 @@ private struct Job
     ready: Atomic[int]
 
     // Raised by the test when it is done, so a server that is deliberately not answering knows when
-    // to let go. **Spun on rather than slept on because the library has no `sleep`** -- card 0400.
+    // to let go. The waiter sleeps between reads rather than spinning, so holding a connection open
+    // for a timeout to fire costs a sleeping thread instead of a core.
     release: Atomic[int]
     request: [2048]u8
     request_len: usize
@@ -64,7 +67,7 @@ private serve(j: *Job)
     // instead, and a connect timeout never fires because the connection succeeded.
     if j.len == 0
         while j.release.load() == 0
-            ()
+            sleep(1.ms)
     else
         conn.send_all(j.reply[0..<j.len]).unwrap_or(())
 

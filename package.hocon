@@ -12,11 +12,14 @@
 
 package {
   name    = "curl"
-  version = "0.1.0"
+  version = "0.1.1"
 
-  // The compiler this was written against. What it certainly needs is a variadic `extern` called
-  // with the argument typed at the call site, which is how every `curl_easy_setopt` here is made.
-  sysl = "0.0.98"
+  // **0.0.99 is a floor rather than a preference.** Every callback here is registered by passing
+  // `&on_body` straight to `curl_easy_setopt`'s ellipsis, and the address of a function became a
+  // legal variadic argument in that release; before it the signature had to be erased through a
+  // `ptr_cast` to `*u8`, which nothing checked. The suite's canned server also sleeps rather than
+  // spinning, and `sysl.posix.time.sleep` arrived in the same release.
+  sysl = "0.0.99"
 }
 
 // **`heap`, because a handle is a `&Client`.** libcurl hands a callback the pointer it was given in
