@@ -12,7 +12,7 @@
 
 package {
   name    = "curl"
-  version = "0.1.1"
+  version = "0.1.2"
 
   // **0.0.99 is a floor rather than a preference.** Every callback here is registered by passing
   // `&on_body` straight to `curl_easy_setopt`'s ellipsis, and the address of a function became a

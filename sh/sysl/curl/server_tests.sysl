@@ -15,7 +15,7 @@ module sh.sysl.curl
 import sh.sysl.curl.c
 import sysl.buf.{Buf, buf}
 import sysl.harness.*
-import sysl.posix.net.{resolve, resolve_passive, socket, Socket}
+import sysl.net.{resolve, resolve_passive, socket, Socket}
 import sysl.posix.threads.{spawn, Thread}
 import sysl.posix.time.sleep
 import sysl.slices.as_ptr

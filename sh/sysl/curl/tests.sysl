@@ -10,7 +10,7 @@ module sh.sysl.curl
 
 import sh.sysl.curl.c
 import sysl.buf.{Buf, buf}
-import sysl.posix.net.{resolve_passive, socket, Socket, Address}
+import sysl.net.{resolve_passive, socket, Socket, Address}
 import sysl.posix.threads.{spawn, Thread}
 import sysl.text.{from_utf8_unchecked, cstring, Search}
 import sysl.slices.as_ptr
